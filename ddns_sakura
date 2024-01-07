@@ -1,0 +1,287 @@
+#!/bin/bash
+
+PWD=`dirname $0`
+cd $PWD
+
+
+CONFIG_FILE="${PWD}/ddns_sakura.config"
+
+
+LASTIP_FILE="${PWD}/ddns_sakura.lastip.txt"
+
+
+
+
+cmd_check() { which $1 > /dev/null 2>&1 || ( echo "$1 command not found" && exit 5 ) }
+
+log() {
+	if [ "$#" -ne 0 ]; then
+		echo "`date "+%Y-%m-%d %H:%M:%S"` [$$]: $@"
+	fi
+}
+
+make_config() {
+	if [ "$#" -ne 2 ]; then
+		return 1
+	fi
+
+	clear
+
+	echo
+	echo "設定ファイルが見つからないため、設定ファイル作成モードを開始します。"
+	echo "途中で中断したい場合は、Ctrl+C キーを押下して終了できます。"
+	echo
+
+	while [ ${#C_TOKEN} -ne 36 ]
+	do
+		echo "アクセストークンを入力してください"
+		read -p "> " C_TOKEN
+		if [ ${#C_TOKEN} -ne 36 ]; then
+			echo "エラー：37文字の英数およびハイフンで入力してください。"
+		fi
+	done
+
+	clear
+
+	while [ ${#C_SECRET} -ne 64 ]
+	do
+		echo "アクセストークンシークレットを入力してください"
+		read -p "> " C_SECRET
+		if [ ${#C_SECRET} -ne 64 ]; then
+			echo "エラー：64文字の英数で入力してください。"
+		fi
+	done
+
+	clear
+
+	declare -A ZONES=(
+		["tk1a"]="東京第1"
+		["tk1b"]="東京第2"
+		["is1a"]="石狩第1"
+		["is1b"]="石狩第2"
+		["other"]="その他"
+	)
+	ZONE_IDS=("is1a" "is1b" "tk1a" "tk1b" "other")
+
+	total=${#ZONE_IDS[@]}
+	echo $total
+	C_ZONE_NUM=0
+	while (( ${C_ZONE_NUM} <= 0 || ${C_ZONE_NUM} > ${total} ));
+	do
+		echo 
+		echo "ゾーンを以下から番号で指定してください。"
+		echo 
+		number=1
+		for zone_id in "${ZONE_IDS[@]}"; do
+			echo -n $((number++))
+			echo ": ${ZONES[${zone_id}]} (${zone_id})"
+		done
+		read -p "> " C_ZONE_ID_NUM
+		C_ZONE_NUM=$(echo ${C_ZONE_ID_NUM})
+		if [ -z ${C_ZONE_NUM} ]; then
+			echo "1から${total}の間の数値を指定してください。"
+			C_ZONE_NUM=0
+			continue
+		fi
+		if (( ${C_ZONE_NUM} <= 0 || ${C_ZONE_NUM} > ${total} )); then
+			echo "1から${total}の間の数値を指定してください。"
+			C_ZONE_NUM=0
+			continue
+		else
+			number=$((--C_ZONE_ID_NUM))
+			C_ZONE=${ZONE_IDS[${number}]}
+		fi
+		if [ ${total} == ${C_ZONE_NUM} ]; then
+			echo 
+			echo "ゾーンIDを入力してください。"
+			read -p "> " C_ZONE
+		fi
+
+		read -p "${C_ZONE}ゾーンでよろしいですか? [N/y]: " ANS
+		ANS=$(echo ${ANS})
+		if [[ -z ${ANS} || "${ANS:0:1}" -ne "y" && "${ANS:0:1}" -ne 'Y' ]]; then
+			C_ZONE_NUM=0
+			continue
+		fi
+	
+	done
+
+
+	while true
+	do
+		echo 
+		echo "リソースIDを入力してください"
+		read -p "> " C_RESOURCE_ID
+		pattern="^[1-9][0-9]+$"
+		if [[ ${C_RESOURCE_ID} =~ $pattern ]]; then
+			break
+		else
+			echo "半角数字のみで入力してください。"
+		fi
+	done
+
+	while true
+	do
+		echo 
+		echo "ホスト名を入力してください"
+		read -p "> " C_HOSTNAME
+		pattern="^[\.\*@_a-zA-Z0-9]+$"
+		if [[ ${C_HOSTNAME} =~ $pattern ]]; then
+			if [ ${#C_HOSTNAME} -gt 63 ]; then
+				echo "1～63文字で入力してください。"
+				continue
+			else
+				break
+			fi
+		else
+			echo "半角英数一部記号（-.@_*）のみ使用できます。"
+			continue
+		fi
+	done
+
+	while true
+	do
+		echo
+		echo "TTLの値を入力してください"
+		read -p "[600] > " C_TTL
+		if [ -z C_TTL ]; then
+			C_TTL=600
+			break
+		fi
+		if [[ ${C_TTL} -le 10 && ${C_TTL} -gt 3600000 ]]; then
+			echo "10～3600000の間の数値を指定してください。"
+		else
+			break
+		fi
+	done
+
+	#
+	# 設定ファイルの生成
+	#
+	cat > $1 << EOS
+{
+        "token": "${C_TOKEN}",
+        "secret": "${C_SECRET}",
+        "zone": "${C_ZONE}",
+        "ddns": {
+                "resource_id": "${C_RESOURCE_ID}",
+                "hostname": "${C_HOSTNAME}",
+                "ttl": "${C_TTL}"
+        }
+}
+EOS
+	return $?
+}
+
+sakura_api() {
+	if [ "$#" -ne 4 ]; then
+		return 1
+	fi
+
+	curl --user "${SEC_TOKEN}":"${SEC_SECRET}" \
+		-X "${2}" \
+		-d "${3}" \
+		-o ${4} \
+		https://secure.sakura.ad.jp/cloud/zone/${SAKURA_ZONE}/api/cloud/1.1${1} \
+		-s
+
+	return $?
+}
+
+get_sakura_dns_ip() {
+	sakura_api "/commonserviceitem/${DNS_RESOURCE_ID}" "GET" "" - \
+		| json -0 "CommonServiceItem.Settings.DNS.ResourceRecordSets" \
+		| json -0 -c "this.Name == '$DNS_HOSTNAME'" '0.RData'
+}
+
+set_sakura_dns_ip() {
+	DNS_CONF=`sakura_api "/commonserviceitem/${DNS_RESOURCE_ID}" "GET" "" - \
+	| json -0 -A -e "
+		for( var i in this ){
+			if( i == 'CommonServiceItem' ){ continue; }
+			delete this[i];
+		}
+		for( var i in this.CommonServiceItem ){
+			if( i == 'Settings' ){ continue; }
+			delete this.CommonServiceItem[i]
+		}
+		var rr = this.CommonServiceItem.Settings.DNS.ResourceRecordSets;
+		var updated = false;
+		for( var i = 0; i < rr.length ; i++){
+ 			if(rr[i].Name != '$DNS_HOSTNAME' ){ continue; }
+			rr[i].RData = '$1';
+			rr[i].TTL = $DNS_TTL;
+			updated = true;
+		}
+		if( !updated ){
+			rr.push({'Name':'$DNS_HOSTNAME','Type':'A','TTL':$DNS_TTL,'RData':'$1'})
+		}
+	"`
+	if [ $? -ne 0 ] ; then
+		return 1
+	fi
+
+	sakura_api "/commonserviceitem/${DNS_RESOURCE_ID}" "PUT" "${DNS_CONF}" - | json Success
+	return ${PIPESTATUS[0]}
+}
+
+
+
+
+cmd_check curl
+cmd_check json
+
+
+if [ ! -f ${CONFIG_FILE} ]; then
+	make_config ${CONFIG_FILE} ${CONFIG_FILE}.sample
+fi
+
+read SEC_TOKEN SEC_SECRET SAKURA_ZONE DNS_RESOURCE_ID DNS_HOSTNAME DNS_TTL< <( json -a token secret zone ddns.resource_id ddns.hostname ddns.ttl< $CONFIG_FILE )
+
+log "===== START ====="
+TIMESTAMP="`date "+%Y%m%d"`"
+
+# CUR_IP=`curl -s http://ieserver.net/ipcheck.shtml`
+CUR_IP=`curl -s https://httpbin.org/ip | json origin`
+#CUR_IP=`curl -s http://ifconfig.me/all.json | json ip_addr`
+LAST_IP=`cat ${LASTIP_FILE}`
+
+if [ -z ${CUR_IP} ]; then
+	log "[ERROR] Failed to look up global IP address."
+	log "===== END ====="
+	exit 1
+fi
+
+if [ "${CUR_IP}" == "${LAST_IP}" ]; then
+	log "[INFO] Global IP address is not changed. (${CUR_IP})"
+	log "===== END ====="
+	exit 2
+fi
+
+SAKURA_IP=`get_sakura_dns_ip`
+if [ $? -ne 0 ]; then
+	log "[ERROR] Failed to lookup SAKURA DNS."
+	log "===== END ====="
+	exit 1
+fi
+
+log "[INFO] Current A record: $SAKURA_IP"
+if [ "${CUR_IP}" == "${SAKURA_IP}" ]; then
+	log "[INFO] No need to update A record."
+	log "===== END ====="
+	exit 3
+fi
+
+log "[INFO] Updating A record"
+RESULT=`set_sakura_dns_ip $CUR_IP`
+if [ $? -ne 0 ]; then
+	log "[ERROR] Failed to update SAKURA DNS."
+	log "===== END ====="
+	exit 1
+fi
+log "[INFO] Result: $RESULT"
+
+echo -n "${CUR_IP}" > ddns_sakura.lastip.txt
+log "===== END ====="
+
+
